@@ -6,3 +6,9 @@ I'm building this live!
 
 - https://www.youtube.com/@orhundev
 - https://www.twitch.tv/orhundev
+
+## Design
+
+> TTY → Ratspace → compositor + terminal + other apps
+
+![](design.png)
