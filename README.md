@@ -9,6 +9,8 @@ I'm building this live!
 
 ## Design
 
-> TTY → Ratspace → compositor + terminal + other apps
+> TTY → Ratspace
+                ├─ PTY-backed terminal panes
+                └─ GUI pane ↔ nested compositor ↔ Firefox
 
 ![](design.png)
