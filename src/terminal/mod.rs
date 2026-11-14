@@ -1,3 +1,5 @@
+mod buffer;
+
 pub mod app;
 pub mod input;
 pub mod pty;
