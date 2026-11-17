@@ -1,6 +1,7 @@
 use std::{
-    ffi::OsStr,
+    env,
     io::{Read, Write},
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},
     thread::{self, JoinHandle},
 };
@@ -30,26 +31,39 @@ pub enum OutputPoll {
 }
 
 impl PtySession {
-    /// Starts the user's default shell at the requested terminal size.
-    pub fn new(cols: u16, rows: u16, wayland_display: &OsStr) -> Result<Self> {
+    /// Starts the selected shell at the requested terminal size.
+    pub fn new(cols: u16, rows: u16) -> Result<Self> {
         let pty = native_pty_system();
         let pair = pty
-            .openpty(pty_size(cols, rows))
+            .openpty(Self::pty_size(cols, rows))
             .context("create shell PTY")?;
         let mut reader = pair.master.try_clone_reader().context("open PTY reader")?;
         let writer = pair.master.take_writer().context("open PTY writer")?;
-        let mut command = CommandBuilder::new_default_prog();
+        let configured_shell = env::var_os(config::RATSPACE_SHELL);
+        let mut command = if let Some(shell) = configured_shell.as_deref() {
+            CommandBuilder::new(shell)
+        } else {
+            let default = CommandBuilder::new_default_prog();
+            let shell = default.get_shell();
+            anyhow::ensure!(
+                !Self::is_current_executable(Path::new(&shell)),
+                "the configured shell is Ratspace itself; set RATSPACE_SHELL to your real shell"
+            );
+            default
+        };
         command.env(config::TERM, config::TERM_VALUE);
-        command.env(config::WAYLAND_DISPLAY, wayland_display);
-        command.env_remove(config::DISPLAY);
-        command.env(config::GDK_BACKEND, config::GDK_BACKEND_VALUE);
-        command.env(config::MOZ_ENABLE_WAYLAND, config::MOZ_ENABLE_WAYLAND_VALUE);
-        command.env(config::XDG_SESSION_TYPE, config::XDG_SESSION_TYPE_VALUE);
+        if let Some(shell) = configured_shell.as_deref() {
+            command.env(config::SHELL, shell);
+            anyhow::ensure!(
+                !Self::is_current_executable(Path::new(shell)),
+                "{} points to Ratspace itself; set it to your real shell",
+                config::RATSPACE_SHELL
+            );
+        }
         let child = pair
             .slave
             .spawn_command(command)
-            .context("start default shell")?;
-        tracing::info!(cols, rows, "started shell in PTY");
+            .context("start shell in PTY")?;
         drop(pair.slave);
         let child = ChildGuard::new(child);
 
@@ -89,7 +103,7 @@ impl PtySession {
     /// Updates the shell's PTY dimensions.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.master
-            .resize(pty_size(cols, rows))
+            .resize(Self::pty_size(cols, rows))
             .context("resize shell PTY")
     }
 
@@ -112,14 +126,44 @@ impl PtySession {
         }
         Ok(())
     }
-}
 
-fn pty_size(cols: u16, rows: u16) -> PtySize {
-    PtySize {
-        rows: rows.max(1),
-        cols: cols.max(1),
-        pixel_width: 0,
-        pixel_height: 0,
+    /// Builds a PTY size with nonzero cell dimensions.
+    fn pty_size(cols: u16, rows: u16) -> PtySize {
+        PtySize {
+            rows: rows.max(1),
+            cols: cols.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+
+    /// Checks whether a shell path resolves to the current Ratspace executable.
+    fn is_current_executable(shell: &Path) -> bool {
+        let Ok(current) = env::current_exe() else {
+            return false;
+        };
+        let Some(shell) = Self::resolve_program(shell) else {
+            return false;
+        };
+        Self::same_path(&current, &shell)
+    }
+
+    /// Resolves a program name through PATH when it has no directory component.
+    fn resolve_program(program: &Path) -> Option<PathBuf> {
+        if program.components().count() > 1 {
+            return Some(program.to_path_buf());
+        }
+        env::split_paths(&env::var_os("PATH")?)
+            .map(|directory| directory.join(program))
+            .find(|path| path.is_file())
+    }
+
+    /// Compares paths after canonicalization when possible.
+    fn same_path(left: &Path, right: &Path) -> bool {
+        match (left.canonicalize(), right.canonicalize()) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => left == right,
+        }
     }
 }
 

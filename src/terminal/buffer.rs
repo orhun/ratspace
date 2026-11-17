@@ -6,19 +6,19 @@ use ratatui::{
 };
 
 /// Adapts a VT screen into Ratatui buffer cells.
-pub(crate) struct Buffer<'a> {
+pub(super) struct Buffer<'a> {
     screen: &'a Screen,
     area: Rect,
 }
 
 impl<'a> Buffer<'a> {
     /// Creates a buffer renderer for the given VT screen and area.
-    pub(crate) fn new(screen: &'a Screen, area: Rect) -> Self {
+    pub(super) fn new(screen: &'a Screen, area: Rect) -> Self {
         Self { screen, area }
     }
 
     /// Writes the VT screen's cells and styles into a Ratatui buffer.
-    pub(crate) fn render(&self, buffer: &mut RatatuiBuffer) {
+    pub(super) fn render(&self, buffer: &mut RatatuiBuffer) {
         let window = self.screen.window();
         for row in 0..self.area.height.min(window.rows()) {
             let Some(screen_row) = window.row(row) else {

@@ -13,4 +13,12 @@ I'm building this live!
                 ├─ PTY-backed terminal panes
                 └─ GUI pane ↔ nested compositor ↔ Firefox
 
+> TTY login
+>    │
+> Ratspace session: shell + command lifecycle
+>    ├─ text command ──> terminal renderer ──> display
+>    └─ GUI command ───> Wayland runtime  ───> same display
+>                                                  │
+>                                       app exits ─┘
+
 ![](design.png)

@@ -24,6 +24,13 @@ pub fn encode_key(event: KeyEvent, terminal: &Terminal) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Encodes pasted text, including bracketed-paste framing when requested.
+pub fn encode_paste(text: &str, terminal: &Terminal) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(text.len() + 12);
+    encode::paste(text, terminal.bracketed_paste(), &mut bytes);
+    bytes
+}
+
 fn key_code(code: KeyCode) -> Option<(Key, bool)> {
     Some(match code {
         KeyCode::Char(character) => (Key::Char(character), false),
