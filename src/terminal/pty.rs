@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     io::{Read, Write},
     sync::mpsc::{self, Receiver, TryRecvError},
     thread::{self, JoinHandle},
@@ -6,6 +7,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+
+use crate::config;
 
 /// Owns the shell PTY and relays its output to the app loop.
 pub struct PtySession {
@@ -28,7 +31,7 @@ pub enum OutputPoll {
 
 impl PtySession {
     /// Starts the user's default shell at the requested terminal size.
-    pub fn new(cols: u16, rows: u16) -> Result<Self> {
+    pub fn new(cols: u16, rows: u16, wayland_display: &OsStr) -> Result<Self> {
         let pty = native_pty_system();
         let pair = pty
             .openpty(pty_size(cols, rows))
@@ -36,11 +39,17 @@ impl PtySession {
         let mut reader = pair.master.try_clone_reader().context("open PTY reader")?;
         let writer = pair.master.take_writer().context("open PTY writer")?;
         let mut command = CommandBuilder::new_default_prog();
-        command.env("TERM", "xterm-256color");
+        command.env(config::TERM, config::TERM_VALUE);
+        command.env(config::WAYLAND_DISPLAY, wayland_display);
+        command.env_remove(config::DISPLAY);
+        command.env(config::GDK_BACKEND, config::GDK_BACKEND_VALUE);
+        command.env(config::MOZ_ENABLE_WAYLAND, config::MOZ_ENABLE_WAYLAND_VALUE);
+        command.env(config::XDG_SESSION_TYPE, config::XDG_SESSION_TYPE_VALUE);
         let child = pair
             .slave
             .spawn_command(command)
             .context("start default shell")?;
+        tracing::info!(cols, rows, "started shell in PTY");
         drop(pair.slave);
         let child = ChildGuard::new(child);
 

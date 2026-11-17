@@ -1,12 +1,10 @@
-mod buffer;
+pub(crate) mod buffer;
 
-pub mod app;
 pub mod input;
 pub mod pty;
-pub mod render;
 
 use anyhow::{Context, Result};
-use fux_vt::{Mode, Parser, Screen, Sink, Size, keys::encode::KeyMode};
+use fux_vt::{Parser, Screen, Sink, Size, keys::encode::KeyMode};
 
 /// Emulates the VT screen used by the shell running in Ratspace.
 pub struct Terminal {
@@ -32,20 +30,14 @@ impl Terminal {
         let mut sink = ReplySink::default();
         let mut remaining = bytes;
         while !remaining.is_empty() || self.emulator.has_work_left() {
-            match self
-                .emulator
-                .process_until_stop(remaining, &mut sink)
-                .context("parse terminal output")?
-            {
-                Some((consumed, _)) => {
-                    remaining = remaining
-                        .get(consumed..)
-                        .context("terminal parser consumed beyond output")?;
-                    if consumed == 0 && !self.emulator.has_work_left() {
-                        break;
-                    }
-                }
-                None => break,
+            let Some((consumed, _)) = self.emulator.process_until_stop(remaining, &mut sink) else {
+                break;
+            };
+            remaining = remaining
+                .get(consumed..)
+                .context("terminal parser consumed beyond output")?;
+            if consumed == 0 && !self.emulator.has_work_left() {
+                break;
             }
         }
         Ok(sink.replies)
@@ -63,11 +55,6 @@ impl Terminal {
     /// Returns the key encoding mode requested by the running program.
     pub fn key_mode(&self) -> KeyMode {
         self.emulator.screen().key_mode()
-    }
-
-    /// Returns whether the running program requested bracketed paste.
-    pub fn bracketed_paste(&self) -> bool {
-        self.emulator.screen().mode(Mode::BracketedPaste)
     }
 }
 
