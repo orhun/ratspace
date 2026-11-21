@@ -5,11 +5,13 @@ use smithay::{
     backend::{
         renderer::{
             damage::OutputDamageTracker,
+            element::surface::WaylandSurfaceRenderElement,
             element::{Kind, memory::MemoryRenderBufferRenderElement},
             gles::GlesRenderer,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
+    desktop::space::{SpaceRenderElements, space_render_elements},
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::calloop::EventLoop,
     utils::{Rectangle, Transform},
@@ -20,6 +22,7 @@ use super::state::State;
 smithay::backend::renderer::element::render_elements! {
     OutputElement<=GlesRenderer>;
     Terminal=MemoryRenderBufferRenderElement<GlesRenderer>,
+    Space=SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
 }
 
 const OUTPUT_NAME: &str = env!("CARGO_PKG_NAME");
@@ -45,6 +48,7 @@ impl WinitOutput {
         let scale_factor = backend.scale_factor();
         let output = Self::create_output(state, size, scale_factor);
         let mut damage_tracker = OutputDamageTracker::from_output(&output);
+        let render_output = output.clone();
         let backend = Rc::new(RefCell::new(backend));
         let redraw_backend = Rc::clone(&backend);
         state.set_redraw_requester(Rc::new(move || {
@@ -54,7 +58,13 @@ impl WinitOutput {
         event_loop
             .handle()
             .insert_source(winit_events, move |event, _, state| {
-                Self::handle_event(event, state, &mut backend.borrow_mut(), &mut damage_tracker);
+                Self::handle_event(
+                    event,
+                    state,
+                    &mut backend.borrow_mut(),
+                    &mut damage_tracker,
+                    &render_output,
+                );
             })
             .map_err(|error| anyhow!("register Winit event source: {error:?}"))?;
 
@@ -111,6 +121,7 @@ impl WinitOutput {
         state: &mut State,
         backend: &mut WinitGraphicsBackend<GlesRenderer>,
         damage_tracker: &mut OutputDamageTracker,
+        output: &Output,
     ) {
         match event {
             WinitEvent::Resized { size, scale_factor } => {
@@ -122,7 +133,7 @@ impl WinitOutput {
             }
             WinitEvent::Input(event) => state.process_input_event(event),
             WinitEvent::Redraw => {
-                if let Err(error) = Self::render_frame(backend, state, damage_tracker) {
+                if let Err(error) = Self::render_frame(backend, state, damage_tracker, output) {
                     state.stop_with_error(error.context("render compositor output"));
                 }
             }
@@ -131,17 +142,22 @@ impl WinitOutput {
         }
     }
 
-    /// Renders the terminal buffer into the nested window and schedules another frame.
+    /// Renders terminal and Wayland surfaces into the nested window.
     fn render_frame(
         backend: &mut WinitGraphicsBackend<GlesRenderer>,
         state: &mut State,
         damage_tracker: &mut OutputDamageTracker,
+        output: &Output,
     ) -> Result<()> {
         let size = backend.window_size();
         let damage = Rectangle::from_size(size);
         {
             let (renderer, mut framebuffer) = backend.bind().context("bind Winit framebuffer")?;
             let mut elements = Vec::new();
+            // Smithay's output element list is front-to-back, so application surfaces come first.
+            let space_elements = space_render_elements(renderer, [&state.space], output, 1.0)
+                .context("render Wayland application surfaces")?;
+            elements.extend(space_elements.into_iter().map(OutputElement::Space));
             if let Some(terminal) = state.terminal_renderer.as_mut() {
                 elements.push(OutputElement::Terminal(
                     MemoryRenderBufferRenderElement::from_buffer(
@@ -158,13 +174,23 @@ impl WinitOutput {
             }
             damage_tracker
                 .render_output(renderer, &mut framebuffer, 0, &elements, OUTPUT_CLEAR_COLOR)
-                .context("render terminal buffer")?;
+                .context("render compositor frame")?;
         }
 
-        let _ = state.display_handle.flush_clients();
         backend
             .submit(Some(&[damage]))
             .context("submit Winit frame")?;
+
+        state.space.elements().for_each(|window| {
+            window.send_frame(
+                output,
+                state.start_time.elapsed(),
+                Some(std::time::Duration::ZERO),
+                |_, _| Some(output.clone()),
+            );
+        });
+        state.space.refresh();
+        let _ = state.display_handle.flush_clients();
         Ok(())
     }
 }

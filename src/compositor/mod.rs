@@ -3,6 +3,7 @@ mod palette;
 mod state;
 mod terminal;
 mod winit;
+mod xdg_shell;
 
 use std::time::Duration;
 
@@ -30,6 +31,7 @@ impl Compositor {
         let (width, height) = output.size();
         state.set_output_size(width, height, output.scale_factor())?;
         state.terminal_renderer = Some(TerminalRenderer::new(width, height)?);
+        state.request_redraw();
 
         event_loop
             .handle()

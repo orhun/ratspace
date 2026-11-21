@@ -1,13 +1,15 @@
-use std::{ffi::OsString, rc::Rc, sync::Arc};
+use std::{ffi::OsString, rc::Rc, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result, anyhow};
 use smithay::{
-    delegate_compositor, delegate_output, delegate_seat, delegate_shm,
+    delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
+    delegate_xdg_shell,
+    desktop::{Space, Window},
     input::{Seat, SeatHandler, SeatState},
     reexports::{
         calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic},
         wayland_server::{
-            Client, Display, DisplayHandle,
+            Client, Display, DisplayHandle, Resource,
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::{wl_buffer, wl_output::WlOutput, wl_surface::WlSurface},
         },
@@ -17,6 +19,16 @@ use smithay::{
         buffer::BufferHandler,
         compositor::{CompositorClientState, CompositorHandler, CompositorState},
         output::{OutputHandler, OutputManagerState},
+        selection::{
+            SelectionHandler,
+            data_device::{
+                ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+                set_data_device_focus,
+            },
+        },
+        shell::xdg::{
+            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+        },
         shm::{ShmHandler, ShmState},
         socket::ListeningSocketSource,
     },
@@ -37,6 +49,8 @@ pub(super) struct State {
     pub(super) display_handle: DisplayHandle,
     /// Signal used to stop the compositor event loop.
     pub(super) loop_signal: smithay::reexports::calloop::LoopSignal,
+    /// Time origin used for Wayland frame callbacks.
+    pub(super) start_time: Instant,
     /// Current output dimensions in physical pixels.
     output_size: (i32, i32),
     /// Wayland output advertised to connected clients.
@@ -45,12 +59,20 @@ pub(super) struct State {
     compositor_state: CompositorState,
     /// State and globals for shared-memory client buffers.
     shm_state: ShmState,
+    /// State and global for Wayland clipboard and drag-and-drop devices.
+    data_device_state: DataDeviceState,
     /// Keeps wl_output globals alive for the display lifetime.
     _output_manager_state: OutputManagerState,
     /// State for the Wayland keyboard seat.
     seat_state: SeatState<State>,
     /// Wayland seat advertised to clients.
     seat: Seat<State>,
+    /// XDG shell global used by native Wayland application windows.
+    xdg_shell_state: XdgShellState,
+    /// Surface space containing application windows above the terminal.
+    pub(super) space: Space<Window>,
+    /// Current application keyboard focus, or none while typing into the shell.
+    app_focus: Option<WlSurface>,
     /// Callback that requests a frame from the host window.
     redraw_requester: Option<Rc<dyn Fn()>>,
     /// VT model receiving shell output and keyboard input.
@@ -75,7 +97,9 @@ impl State {
         let display_handle = display.handle();
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
+        let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
+        let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
 
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "ratspace");
@@ -112,13 +136,18 @@ impl State {
             socket_name,
             display_handle,
             loop_signal: event_loop.get_signal(),
+            start_time: Instant::now(),
             output_size: (1, 1),
             output: None,
             compositor_state,
             shm_state,
+            data_device_state,
             _output_manager_state: output_manager_state,
             seat_state,
             seat,
+            xdg_shell_state,
+            space: Space::default(),
+            app_focus: None,
             redraw_requester: None,
             terminal: None,
             terminal_renderer: None,
@@ -159,12 +188,20 @@ impl State {
             renderer.resize(self.output_size.0, self.output_size.1);
             self.resize_terminal()?;
         }
+        if let Some(output) = &self.output
+            && let Some(geometry) = self.space.output_geometry(output)
+        {
+            super::xdg_shell::resize_toplevels(&self.space, geometry.size);
+        }
+        self.space.refresh();
         Ok(())
     }
 
-    /// Registers the compositor's output with Smithay's output state.
+    /// Registers the output and maps it into the desktop space.
     pub(super) fn install_output(&mut self, output: smithay::output::Output) {
+        self.space.map_output(&output, (0, 0));
         self.output = Some(output);
+        self.space.refresh();
     }
 
     /// Stores the host-window callback used to schedule a compositor frame.
@@ -172,7 +209,7 @@ impl State {
         self.redraw_requester = Some(requester);
     }
 
-    /// Requests a frame from the host window when terminal content changes.
+    /// Requests a frame from the host window when terminal or surface content changes.
     pub(super) fn request_redraw(&self) {
         if let Some(requester) = &self.redraw_requester {
             requester();
@@ -255,7 +292,7 @@ impl State {
         self.loop_signal.stop();
     }
 
-    /// Routes keyboard events to the shell while this step has no app surfaces.
+    /// Routes keyboard events to the focused Wayland app or the shell.
     pub(super) fn process_input_event<I: smithay::backend::input::InputBackend>(
         &mut self,
         event: smithay::backend::input::InputEvent<I>,
@@ -278,6 +315,9 @@ impl State {
             serial,
             time,
             |state, modifiers, sym| {
+                if state.app_focus.is_some() {
+                    return FilterResult::Forward;
+                }
                 if key_state == KeyState::Pressed {
                     if let Some(key) = compositor_input::crossterm_key(sym.modified_sym()) {
                         let mut key_modifiers = crossterm::event::KeyModifiers::empty();
@@ -308,6 +348,13 @@ impl State {
             },
         );
     }
+
+    /// Moves keyboard focus between a Wayland app and the shell.
+    fn set_app_focus(&mut self, surface: Option<WlSurface>) {
+        let keyboard = self.seat.get_keyboard().expect("keyboard was created");
+        keyboard.set_focus(self, surface.clone(), SERIAL_COUNTER.next_serial());
+        self.app_focus = surface;
+    }
 }
 
 /// Releases client buffer resources when their Wayland buffers are destroyed.
@@ -327,6 +374,22 @@ impl CompositorHandler for State {
 
     fn commit(&mut self, surface: &WlSurface) {
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
+        if !smithay::wayland::compositor::is_sync_subsurface(surface) {
+            let mut root = surface.clone();
+            while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
+                root = parent;
+            }
+            if let Some(window) = self.space.elements().find(|window| {
+                window
+                    .toplevel()
+                    .is_some_and(|toplevel| toplevel.wl_surface() == &root)
+            }) {
+                window.on_commit();
+            }
+        }
+        super::xdg_shell::handle_commit(&self.space, surface);
+        self.space.refresh();
+        self.request_redraw();
     }
 }
 
@@ -342,7 +405,7 @@ impl OutputHandler for State {
     fn output_bound(&mut self, _output: smithay::output::Output, _wl_output: WlOutput) {}
 }
 
-/// Routes the Wayland keyboard seat; keyboard input remains with the shell.
+/// Routes the Wayland keyboard seat for app focus and shell input.
 impl SeatHandler for State {
     type KeyboardFocus = WlSurface;
     type PointerFocus = WlSurface;
@@ -352,7 +415,10 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        let client = focused.and_then(|surface| self.display_handle.get_client(surface.id()).ok());
+        set_data_device_focus(&self.display_handle, seat, client);
+    }
 
     fn cursor_image(
         &mut self,
@@ -380,3 +446,85 @@ delegate_compositor!(State);
 delegate_shm!(State);
 delegate_seat!(State);
 delegate_output!(State);
+delegate_xdg_shell!(State);
+delegate_data_device!(State);
+
+/// Stores per-seat clipboard selection state for connected Wayland clients.
+impl SelectionHandler for State {
+    type SelectionUserData = ();
+}
+
+/// Handles client initiated drag-and-drop requests.
+impl ClientDndGrabHandler for State {}
+
+/// Handles compositor initiated drag-and-drop requests.
+impl ServerDndGrabHandler for State {}
+
+/// Exposes the Wayland clipboard and data device manager.
+impl DataDeviceHandler for State {
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self.data_device_state
+    }
+}
+
+/// Implements the XDG shell lifecycle for native Wayland application windows.
+impl XdgShellHandler for State {
+    fn xdg_shell_state(&mut self) -> &mut XdgShellState {
+        &mut self.xdg_shell_state
+    }
+
+    fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        let window = Window::new_wayland_window(surface.clone());
+        self.space.map_element(window, (0, 0), true);
+        self.set_app_focus(Some(surface.wl_surface().clone()));
+        self.space.refresh();
+        self.request_redraw();
+    }
+
+    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
+        // This step supports top-level windows only; popup surfaces are not mapped yet.
+    }
+
+    fn grab(
+        &mut self,
+        _surface: PopupSurface,
+        _seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
+        _serial: smithay::utils::Serial,
+    ) {
+        // Pointer grabs are outside this keyboard-only milestone.
+    }
+
+    fn reposition_request(
+        &mut self,
+        _surface: PopupSurface,
+        _positioner: PositionerState,
+        _token: u32,
+    ) {
+        // Popup repositioning is outside this keyboard-only milestone.
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        let window = self
+            .space
+            .elements()
+            .find(|window| {
+                window
+                    .toplevel()
+                    .is_some_and(|toplevel| toplevel.wl_surface() == wl_surface)
+            })
+            .cloned();
+        if let Some(window) = window {
+            self.space.unmap_elem(&window);
+        }
+        if self
+            .app_focus
+            .as_ref()
+            .is_some_and(|focus| focus == wl_surface)
+        {
+            self.set_app_focus(None);
+        }
+        self.space.refresh();
+        self.request_redraw();
+    }
+}
