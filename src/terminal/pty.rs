@@ -1,5 +1,6 @@
 use std::{
     env,
+    ffi::OsStr,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},
@@ -32,7 +33,7 @@ pub enum OutputPoll {
 
 impl PtySession {
     /// Starts the selected shell at the requested terminal size.
-    pub fn new(cols: u16, rows: u16) -> Result<Self> {
+    pub fn new(cols: u16, rows: u16, wayland_display: &OsStr) -> Result<Self> {
         let pty = native_pty_system();
         let pair = pty
             .openpty(Self::pty_size(cols, rows))
@@ -52,6 +53,7 @@ impl PtySession {
             default
         };
         command.env(config::TERM, config::TERM_VALUE);
+        command.env(config::WAYLAND_DISPLAY, wayland_display);
         if let Some(shell) = configured_shell.as_deref() {
             command.env(config::SHELL, shell);
             anyhow::ensure!(

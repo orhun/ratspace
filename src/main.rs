@@ -1,15 +1,17 @@
+mod compositor;
 mod config;
 mod terminal;
 
-use terminal::{Terminal, app, pty::PtySession, render::Renderer};
+use compositor::Compositor;
+use terminal::{Terminal, pty::PtySession};
 
 fn main() -> anyhow::Result<()> {
     println!("🐀🌌");
 
-    let mut renderer = Renderer::new()?;
-    let (cols, rows) = renderer.size()?;
-    let mut screen = Terminal::new(cols, rows)?;
-    let mut shell = PtySession::new(cols, rows)?;
+    let compositor = Compositor::new()?;
+    let (cols, rows) = compositor.terminal_size();
+    let screen = Terminal::new(cols, rows)?;
+    let shell = PtySession::new(cols, rows, compositor.wayland_display())?;
 
-    app::run(&mut screen, &mut shell, &mut renderer)
+    compositor.run(screen, shell)
 }
