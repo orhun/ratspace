@@ -22,3 +22,7 @@ I'm building this live!
 >                                       app exits ─┘
 
 ![](design.png)
+
+## Terminal Renderer
+
+The `ratatui-smithay` workspace crate rasterizes Ratatui cells into a damage-tracked Smithay buffer. It uses Parley for shaping and Swash glyph rasterization, then caches glyph masks and repaints changed cells.

@@ -12,15 +12,21 @@ pub(crate) struct Buffer<'a> {
 }
 
 impl<'a> Buffer<'a> {
-    /// Creates a buffer renderer for the given VT screen and area.
+    /// Creates a row renderer for the given VT screen and area.
     pub(crate) fn new(screen: &'a Screen, area: Rect) -> Self {
         Self { screen, area }
     }
 
-    /// Writes the VT screen's cells and styles into a Ratatui buffer.
-    pub(crate) fn render(&self, buffer: &mut RatatuiBuffer) {
+    /// Writes selected VT rows and styles into a retained Ratatui buffer.
+    pub(crate) fn render_rows(&self, rows: &[u16], buffer: &mut RatatuiBuffer) {
         let window = self.screen.window();
-        for row in 0..self.area.height.min(window.rows()) {
+        for &row in rows {
+            if row >= self.area.height || row >= window.rows() {
+                continue;
+            }
+            for col in 0..self.area.width {
+                buffer[(self.area.x + col, self.area.y + row)].reset();
+            }
             let Some(screen_row) = window.row(row) else {
                 continue;
             };

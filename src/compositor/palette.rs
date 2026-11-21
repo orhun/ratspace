@@ -33,31 +33,29 @@ impl Palette {
         })
     }
 
-    /// Returns the configured default foreground color.
-    pub(super) fn foreground(&self) -> Color {
-        self.foreground
-    }
-
-    /// Returns the configured default background color.
-    pub(super) fn background(&self) -> Color {
-        self.background
-    }
-
     /// Returns the configured default background as RGB components.
     pub(super) fn background_rgb(&self) -> [u8; 3] {
         Self::rgb(self.background)
     }
 
-    /// Resolves Ratatui reset and indexed colors through the terminal palette.
-    pub(super) fn resolve_cells(&self, cells: &mut Buffer) {
-        for cell in &mut cells.content {
-            let mut foreground = self.resolve_color(cell.fg, self.foreground);
-            cell.bg = self.resolve_color(cell.bg, self.background);
-            if cell.modifier.contains(Modifier::DIM) {
-                foreground = Self::dim(foreground);
-                cell.modifier.remove(Modifier::DIM);
+    /// Returns the configured default foreground as RGB components.
+    pub(super) fn foreground_rgb(&self) -> [u8; 3] {
+        Self::rgb(self.foreground)
+    }
+
+    /// Resolves reset and indexed colors for selected Ratatui rows.
+    pub(super) fn resolve_rows(&self, cells: &mut Buffer, rows: &[u16]) {
+        for &row in rows {
+            for col in 0..cells.area.width {
+                let cell = &mut cells[(col, row)];
+                let mut foreground = self.resolve_color(cell.fg, self.foreground);
+                cell.bg = self.resolve_color(cell.bg, self.background);
+                if cell.modifier.contains(Modifier::DIM) {
+                    foreground = Self::dim(foreground);
+                    cell.modifier.remove(Modifier::DIM);
+                }
+                cell.fg = foreground;
             }
-            cell.fg = foreground;
         }
     }
 

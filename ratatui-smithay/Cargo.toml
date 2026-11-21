@@ -1,0 +1,12 @@
+[package]
+name = "ratatui-smithay"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+parley = { version = "0.9.0", default-features = false, features = ["system"] }
+ratatui = { version = "0.30.2", default-features = false }
+smithay = { version = "0.7.0", default-features = false }
+swash = { version = "0.2.10", default-features = false, features = ["std", "render"] }
+unicode-width = "0.2.3"

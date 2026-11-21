@@ -149,9 +149,9 @@ impl WinitOutput {
         damage_tracker: &mut OutputDamageTracker,
         output: &Output,
     ) -> Result<()> {
-        let size = backend.window_size();
-        let damage = Rectangle::from_size(size);
-        {
+        // Query the age before binding because binding borrows the backend's renderer.
+        let age = backend.buffer_age().unwrap_or(0);
+        let damage = {
             let (renderer, mut framebuffer) = backend.bind().context("bind Winit framebuffer")?;
             let mut elements = Vec::new();
             // Smithay's output element list is front-to-back, so application surfaces come first.
@@ -159,27 +159,47 @@ impl WinitOutput {
                 .context("render Wayland application surfaces")?;
             elements.extend(space_elements.into_iter().map(OutputElement::Space));
             if let Some(terminal) = state.terminal_renderer.as_mut() {
+                let physical_size = output
+                    .current_mode()
+                    .context("output has no current mode")?
+                    .size;
+                let logical_size = state
+                    .space
+                    .output_geometry(output)
+                    .context("output is not mapped in the desktop space")?
+                    .size;
+                // Map the physical pixel buffer onto the output's logical bounds.
                 elements.push(OutputElement::Terminal(
                     MemoryRenderBufferRenderElement::from_buffer(
                         renderer,
                         (0.0, 0.0),
                         terminal.pixels(),
                         None,
-                        None,
-                        None,
+                        Some(Rectangle::from_size(
+                            (f64::from(physical_size.w), f64::from(physical_size.h)).into(),
+                        )),
+                        Some(logical_size),
                         Kind::Unspecified,
                     )
                     .context("upload terminal buffer")?,
                 ));
             }
-            damage_tracker
-                .render_output(renderer, &mut framebuffer, 0, &elements, OUTPUT_CLEAR_COLOR)
+            let rendered = damage_tracker
+                .render_output(
+                    renderer,
+                    &mut framebuffer,
+                    age,
+                    &elements,
+                    OUTPUT_CLEAR_COLOR,
+                )
                 .context("render compositor frame")?;
+            rendered.damage.cloned()
+        };
+        if let Some(damage) = damage {
+            backend
+                .submit(Some(&damage))
+                .context("submit Winit frame")?;
         }
-
-        backend
-            .submit(Some(&[damage]))
-            .context("submit Winit frame")?;
 
         state.space.elements().for_each(|window| {
             window.send_frame(

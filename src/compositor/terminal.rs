@@ -1,285 +1,105 @@
-use anyhow::{Context, Result, anyhow};
-use fontdb::{Database, Family, Query};
-use fux_vt::{Mode, Screen};
-use ratatui::{backend::Backend, buffer::Buffer as RatatuiBuffer, layout::Rect};
-use smithay::{
-    backend::{allocator::Fourcc, renderer::element::memory::MemoryRenderBuffer},
-    utils::{Rectangle, Transform},
-};
-use soft_ratatui::{CosmicText, RgbPixmap, SoftBackend};
+use anyhow::Result;
+use fux_vt::{Mark, Mode, Screen};
+use ratatui::{buffer::Buffer as RatatuiBuffer, layout::Rect};
+use ratatui_smithay::RatatuiSmithay;
+use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 
 use crate::{config, terminal::buffer::Buffer};
 
 use super::palette::Palette;
 
-/// Rasterizes changed Ratatui cells into a Smithay memory buffer.
+/// Adapts VT screen changes into the Ratatui and Smithay terminal renderer.
 pub(super) struct TerminalRenderer {
-    width: i32,
-    height: i32,
-    pixels: MemoryRenderBuffer,
-    rgba: Vec<u8>,
-    backend: SoftBackend<CosmicText>,
+    renderer: RatatuiSmithay,
+    cells: RatatuiBuffer,
     palette: Palette,
-    previous_cursor: Option<(bool, u16, u16)>,
-    needs_full_redraw: bool,
+    screen_mark: Option<Mark>,
+    reverse_video: Option<bool>,
 }
 
 impl TerminalRenderer {
-    /// Creates a software terminal renderer for the compositor output.
+    /// Creates a font renderer and a cell buffer for one compositor output.
     pub(super) fn new(width: i32, height: i32) -> Result<Self> {
-        let width = width.max(1);
-        let height = height.max(1);
         let palette = Palette::new()?;
-        let font_data = Self::load_monospace_font()?;
-        let mut backend =
-            SoftBackend::<CosmicText>::new(1, 1, config::TERMINAL_FONT_SIZE as i32, &font_data);
-        backend.cursor_config.blink = false;
-        let (cols, rows) = Self::cell_size_for(&backend, width, height);
-        Self::reset_soft_backend(&mut backend, cols, rows, &palette);
-
-        let mut renderer = Self {
+        let renderer = RatatuiSmithay::new(
             width,
             height,
-            pixels: MemoryRenderBuffer::new(
-                Fourcc::Abgr8888,
-                (width, height),
-                1,
-                Transform::Normal,
-                None,
-            ),
-            rgba: vec![0; (width * height * 4) as usize],
-            backend,
+            config::TERMINAL_FONT_SIZE,
+            config::TERMINAL_FONT_FAMILY,
+            palette.foreground_rgb(),
+            palette.background_rgb(),
+        )?;
+        let cells = RatatuiBuffer::empty(Self::area(&renderer));
+
+        Ok(Self {
+            renderer,
+            cells,
             palette,
-            previous_cursor: None,
-            needs_full_redraw: true,
-        };
-        renderer.fill_background();
-        Ok(renderer)
+            screen_mark: None,
+            reverse_video: None,
+        })
     }
 
     /// Returns the output size in terminal cells.
     pub(super) fn cell_size(&self) -> (u16, u16) {
-        (
-            self.backend.buffer.area.width,
-            self.backend.buffer.area.height,
-        )
+        self.renderer.cell_size()
     }
 
-    /// Resizes the soft backend and the Smithay output buffer.
+    /// Resizes the Smithay pixel buffer and resets the retained cell state.
     pub(super) fn resize(&mut self, width: i32, height: i32) {
-        self.width = width.max(1);
-        self.height = height.max(1);
-        let (cols, rows) = Self::cell_size_for(&self.backend, self.width, self.height);
-        Self::reset_soft_backend(&mut self.backend, cols, rows, &self.palette);
-        self.pixels.render().resize((self.width, self.height));
-        self.rgba.resize((self.width * self.height * 4) as usize, 0);
-        self.fill_background();
-        self.previous_cursor = None;
-        self.needs_full_redraw = true;
+        self.renderer.resize(width, height);
+        self.cells = RatatuiBuffer::empty(Self::area(&self.renderer));
+        self.screen_mark = None;
+        self.reverse_video = None;
     }
 
-    /// Updates changed cells and uploads their rows to Smithay.
+    /// Renders changed VT rows into the retained Smithay buffer.
     pub(super) fn draw(&mut self, screen: &Screen) -> Result<()> {
         let (cols, rows) = self.cell_size();
         let area = Rect::new(0, 0, cols, rows);
-        let mut cells = RatatuiBuffer::empty(area);
-        Buffer::new(screen, area).render(&mut cells);
-        self.palette.resolve_cells(&mut cells);
-
-        let mut changed_cells = Vec::new();
-        let mut dirty_rows = Vec::new();
-        for row in 0..rows {
-            let mut row_changed = false;
-            for col in 0..cols {
-                if cells[(col, row)] != self.backend.buffer[(col, row)] {
-                    changed_cells.push((col, row, &cells[(col, row)]));
-                    row_changed = true;
-                }
-            }
-            if row_changed {
-                dirty_rows.push(row);
-            }
-        }
-        let cells_changed = !changed_cells.is_empty();
-        let blinking_cells = !self.backend.always_redraw_list.is_empty();
-        if cells_changed || blinking_cells {
-            self.backend.draw(changed_cells.into_iter())?;
-        }
-
-        let (row, col) = screen.cursor_position();
-        let visible = screen.mode(Mode::ShowCursor) && row < rows && col < cols;
-        let cursor = (visible, row, col);
-        let cursor_changed = self.previous_cursor != Some(cursor);
-        if cursor_changed {
-            if let Some((was_visible, previous_row, _)) = self.previous_cursor
-                && was_visible
-                && previous_row < rows
-            {
-                Self::add_dirty_row(&mut dirty_rows, previous_row);
-            }
-            if visible {
-                Self::add_dirty_row(&mut dirty_rows, row);
-            }
-            self.previous_cursor = Some(cursor);
-        }
-        if cells_changed || blinking_cells || cursor_changed {
-            Backend::set_cursor_position(&mut self.backend, (col, row))?;
-            if visible {
-                Backend::show_cursor(&mut self.backend)?;
-            } else {
-                Backend::hide_cursor(&mut self.backend)?;
-            }
-            Backend::flush(&mut self.backend)?;
-        }
-
-        for &(_, row) in &self.backend.always_redraw_list {
-            if row < rows {
-                Self::add_dirty_row(&mut dirty_rows, row);
-            }
-        }
-
-        if self.needs_full_redraw {
-            dirty_rows = (0..rows).collect();
-            self.needs_full_redraw = false;
-        }
-        if dirty_rows.is_empty() {
-            return Ok(());
-        }
-
-        self.copy_pixmap_rows(&dirty_rows);
-        self.upload_rows(&dirty_rows)
-    }
-
-    /// Returns the memory buffer used by the terminal layer.
-    pub(super) fn pixels(&self) -> &MemoryRenderBuffer {
-        &self.pixels
-    }
-
-    /// Loads the system's preferred monospace font into owned font data.
-    fn load_monospace_font() -> Result<Vec<u8>> {
-        let mut fonts = Database::new();
-        fonts.load_system_fonts();
-        let families = [
-            Family::Name(config::TERMINAL_FONT_FAMILY),
-            Family::Monospace,
-        ];
-        let id = fonts
-            .query(&Query {
-                families: &families,
-                ..Query::default()
-            })
-            .context("find a system monospace font")?;
-        fonts
-            .with_face_data(id, |data, _| data.to_vec())
-            .ok_or_else(|| anyhow!("read system monospace font data"))
-    }
-
-    /// Measures how many soft-backend cells fit in the output pixels.
-    fn cell_size_for(backend: &SoftBackend<CosmicText>, width: i32, height: i32) -> (u16, u16) {
-        let cell_width = backend.char_width.max(1) as i32;
-        let cell_height = backend.char_height.max(1) as i32;
-        (
-            (width / cell_width).max(1) as u16,
-            (height / cell_height).max(1) as u16,
-        )
-    }
-
-    /// Resets the soft backend without rasterizing its temporary empty cells.
-    fn reset_soft_backend(
-        backend: &mut SoftBackend<CosmicText>,
-        cols: u16,
-        rows: u16,
-        palette: &Palette,
-    ) {
-        backend.buffer.resize(Rect::new(0, 0, cols, rows));
-        backend.buffer.reset();
-        for cell in &mut backend.buffer.content {
-            cell.fg = palette.foreground();
-            cell.bg = palette.background();
-        }
-        backend.rgb_pixmap = RgbPixmap::new(
-            backend.char_width * usize::from(cols),
-            backend.char_height * usize::from(rows),
-        );
-        backend.rgb_pixmap.fill(palette.background_rgb());
-        backend.always_redraw_list.clear();
-        backend.rendered_cursor = None;
-        backend.cursor = false;
-    }
-
-    /// Adds a row to the dirty list once.
-    fn add_dirty_row(rows: &mut Vec<u16>, row: u16) {
-        if !rows.contains(&row) {
-            rows.push(row);
-        }
-    }
-
-    /// Fills the retained output with the configured terminal background.
-    fn fill_background(&mut self) {
-        let background = self.palette.background_rgb();
-        for pixel in self.rgba.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&[background[0], background[1], background[2], 255]);
-        }
-    }
-
-    /// Copies selected RGB pixmap rows into the retained RGBA output.
-    fn copy_pixmap_rows(&mut self, rows: &[u16]) {
-        let source_width = self.backend.get_pixmap_width();
-        let source_height = self.backend.get_pixmap_height();
-        let source = self.backend.get_pixmap_data();
-        let cell_height = self.backend.char_height;
-        let copy_width = source_width.min(self.width as usize);
-        let background = self.palette.background_rgb();
-
-        for &row in rows {
-            for cell_y in 0..cell_height {
-                let y = usize::from(row) * cell_height + cell_y;
-                if y >= source_height || y >= self.height as usize {
-                    continue;
-                }
-                let source_start = y * source_width * 3;
-                let dest_start = y * self.width as usize * 4;
-                let dest_end = dest_start + self.width as usize * 4;
-                let destination = &mut self.rgba[dest_start..dest_end];
-                for pixel in destination.chunks_exact_mut(4) {
-                    pixel.copy_from_slice(&[background[0], background[1], background[2], 255]);
-                }
-                for (destination, source) in destination
-                    .chunks_exact_mut(4)
-                    .take(copy_width)
-                    .zip(source[source_start..source_start + copy_width * 3].chunks_exact(3))
-                {
-                    destination.copy_from_slice(&[source[0], source[1], source[2], 255]);
-                }
-            }
-        }
-    }
-
-    /// Uploads changed output rows and their damage regions to Smithay.
-    fn upload_rows(&mut self, rows: &[u16]) -> Result<()> {
-        let width = self.width;
-        let height = self.height;
-        let cell_height = self.backend.char_height as i32;
-        let updates: Vec<_> = rows
-            .iter()
-            .map(|&row| {
-                let y = i32::from(row) * cell_height;
-                let row_height = (height - y).min(cell_height);
-                let start = (y * width * 4) as usize;
-                let end = start + (row_height * width * 4) as usize;
-                let damage = Rectangle::new((0, y).into(), (width, row_height).into());
-                (start, end, damage)
+        let previous_mark = self.screen_mark;
+        let reverse_video = screen.mode(Mode::ReverseVideo);
+        let full_refresh = previous_mark
+            .is_none_or(|mark| screen.full_refresh_since(mark) || screen.scrolled_since(mark) > 0)
+            || self.reverse_video != Some(reverse_video);
+        let window = screen.window();
+        let changed_rows: Vec<_> = (0..rows)
+            .filter(|row| {
+                full_refresh
+                    || previous_mark.is_some_and(|mark| {
+                        window.row(*row).is_some_and(|row| row.changed_since(mark))
+                    })
             })
             .collect();
 
-        self.pixels
-            .render()
-            .draw(|buffer| {
-                for (start, end, _) in &updates {
-                    buffer[*start..*end].copy_from_slice(&self.rgba[*start..*end]);
-                }
-                Ok::<_, anyhow::Error>(updates.into_iter().map(|(_, _, rect)| rect).collect())
-            })
-            .context("update terminal render buffer")
+        if !changed_rows.is_empty() {
+            Buffer::new(screen, area).render_rows(&changed_rows, &mut self.cells);
+            self.palette.resolve_rows(&mut self.cells, &changed_rows);
+        }
+        self.renderer.draw(
+            &self.cells,
+            &changed_rows,
+            Self::visible_cursor(screen, cols, rows),
+        )?;
+        self.screen_mark = Some(screen.mark());
+        self.reverse_video = Some(reverse_video);
+        Ok(())
+    }
+
+    /// Returns the memory buffer used by the compositor output.
+    pub(super) fn pixels(&self) -> &MemoryRenderBuffer {
+        self.renderer.pixels()
+    }
+
+    /// Returns the terminal cell area matching the renderer's current size.
+    fn area(renderer: &RatatuiSmithay) -> Rect {
+        let (cols, rows) = renderer.cell_size();
+        Rect::new(0, 0, cols, rows)
+    }
+
+    /// Returns the visible cursor in Ratatui x/y order.
+    fn visible_cursor(screen: &Screen, cols: u16, rows: u16) -> Option<(u16, u16)> {
+        let (row, col) = screen.cursor_position();
+        (screen.mode(Mode::ShowCursor) && row < rows && col < cols).then_some((col, row))
     }
 }
