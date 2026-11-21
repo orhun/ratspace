@@ -2,6 +2,8 @@ mod input;
 mod palette;
 mod state;
 mod terminal;
+#[cfg(feature = "tty")]
+mod tty;
 mod winit;
 mod xdg_shell;
 
@@ -14,7 +16,7 @@ use crate::terminal::{Terminal, pty::PtySession};
 
 use self::{state::State, terminal::TerminalRenderer, winit::WinitOutput};
 
-/// Owns Ratspace's Wayland server and its single nested Winit output.
+/// Owns Ratspace's Wayland server, shell, and selected display backend.
 pub struct Compositor {
     event_loop: EventLoop<'static, State>,
     state: State,
@@ -23,13 +25,38 @@ pub struct Compositor {
 impl Compositor {
     /// Creates the nested output and a Wayland socket for the shell.
     pub fn new() -> Result<Self> {
+        let (mut event_loop, mut state) = Self::initialize()?;
+        let output = WinitOutput::init(&mut event_loop, &mut state)?;
+        let (width, height) = output.size();
+        Self::finish(event_loop, state, width, height, output.scale_factor())
+    }
+
+    /// Creates a DRM output and Wayland socket for running directly on a TTY.
+    #[cfg(feature = "tty")]
+    pub fn new_tty() -> Result<Self> {
+        let (mut event_loop, mut state) = Self::initialize()?;
+        let (width, height) = tty::TtyOutput::init(&mut event_loop, &mut state)?;
+        Self::finish(event_loop, state, width, height, 1.0)
+    }
+
+    /// Creates the shared Wayland protocol state and compositor event loop.
+    fn initialize() -> Result<(EventLoop<'static, State>, State)> {
         let mut event_loop = EventLoop::try_new().context("create compositor event loop")?;
         let display =
             smithay::reexports::wayland_server::Display::new().context("create Wayland display")?;
-        let mut state = State::new(&mut event_loop, display)?;
-        let output = WinitOutput::init(&mut event_loop, &mut state)?;
-        let (width, height) = output.size();
-        state.set_output_size(width, height, output.scale_factor())?;
+        let state = State::new(&mut event_loop, display)?;
+        Ok((event_loop, state))
+    }
+
+    /// Initializes terminal rendering and the shared shell polling loop.
+    fn finish(
+        event_loop: EventLoop<'static, State>,
+        mut state: State,
+        width: i32,
+        height: i32,
+        scale_factor: f64,
+    ) -> Result<Self> {
+        state.set_output_size(width, height, scale_factor)?;
         state.terminal_renderer = Some(TerminalRenderer::new(width, height)?);
         state.request_redraw();
 

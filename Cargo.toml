@@ -3,6 +3,16 @@ name = "ratspace"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+tty = [
+    "smithay/backend_drm",
+    "smithay/backend_udev",
+    "smithay/backend_gbm",
+    "smithay/backend_libinput",
+    "smithay/backend_session_libseat",
+]
+
 [dependencies]
 anyhow = "1.0.104"
 crossterm = "0.29.0"
